@@ -36,9 +36,10 @@ const GROUP_REPLY_ONLY_WHEN_MENTIONED =
 const WEBHOOK_DOMAIN = (process.env.WEBHOOK_DOMAIN || "").replace(/\/+$/, ""); // no trailing slash
 
 // ===== GEMINI CONFIG =====
-const GEMINI_MODEL = "gemini-1.5-flash"; // (မရရင်) gemini-1.5-flash
+const GEMINI_MODEL = "gemini-2.5-flash-lite";
 const GEMINI_ENDPOINT =
-  `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent`;
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
 // ===== CORE OBJECTS =====
 const bot = new Telegraf(BOT_TOKEN);
 
