@@ -19,13 +19,15 @@ const BOT_NAME = process.env.BOT_NAME || "Nora";
 const LOVER_NAME = process.env.LOVER_NAME || "Bika";
 
 const OWNER_ID =
-  parseInt(process.env.OWNER_ID || "0", 10) && parseInt(process.env.OWNER_ID || "0", 10) > 0
+  parseInt(process.env.OWNER_ID || "0", 10) &&
+  parseInt(process.env.OWNER_ID || "0", 10) > 0
     ? parseInt(process.env.OWNER_ID, 10)
     : null;
 
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "nora_bot";
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || "sessions";
-const MONGODB_CHATS_COLLECTION = process.env.MONGODB_CHATS_COLLECTION || "chats";
+const MONGODB_CHATS_COLLECTION =
+  process.env.MONGODB_CHATS_COLLECTION || "chats";
 
 const MAX_HISTORY = clampInt(process.env.MAX_HISTORY, 16, 4, 40);
 const GROUP_REPLY_ONLY_WHEN_MENTIONED =
@@ -208,6 +210,39 @@ async function touchChat(ctx) {
   );
 }
 
+// ===== LONG MESSAGE SENDER (avoid Telegram 4096 cut) =====
+const TELEGRAM_LIMIT = 3900; // little lower than 4096 for safety
+
+async function sendLongMessage(ctx, text, extra = {}) {
+  if (!text) return;
+  let remaining = text.toString();
+
+  while (remaining.length > 0) {
+    if (remaining.length <= TELEGRAM_LIMIT) {
+      await ctx.reply(remaining, {
+        disable_web_page_preview: true,
+        ...extra,
+      });
+      break;
+    }
+
+    let sliceIndex = remaining.lastIndexOf("\n\n", TELEGRAM_LIMIT);
+    if (sliceIndex === -1) sliceIndex = remaining.lastIndexOf("\n", TELEGRAM_LIMIT);
+    if (sliceIndex === -1) sliceIndex = remaining.lastIndexOf(" ", TELEGRAM_LIMIT);
+    if (sliceIndex === -1) sliceIndex = TELEGRAM_LIMIT;
+
+    const chunk = remaining.slice(0, sliceIndex).trimEnd();
+    remaining = remaining.slice(sliceIndex).trimStart();
+
+    if (chunk.length > 0) {
+      await ctx.reply(chunk, {
+        disable_web_page_preview: true,
+        ...extra,
+      });
+    }
+  }
+}
+
 // ===== Gemini =====
 function buildSystemPrompt(ctx) {
   const userName = getDisplayName(ctx);
@@ -245,6 +280,7 @@ CONTEXT:
 
 async function callGemini(ctx, userText, history) {
   const systemPrompt = buildSystemPrompt(ctx);
+  const isGroup = isGroupChat(ctx);
 
   const contents = [];
   const limitedHistory = history.slice(-MAX_HISTORY);
@@ -264,7 +300,7 @@ async function callGemini(ctx, userText, history) {
     },
     generationConfig: {
       temperature: 0.9,
-      maxOutputTokens: 380,
+      maxOutputTokens: isGroup ? 260 : 380, // group မှာအဖြေတိုအောင်
       topP: 0.95,
     },
   };
@@ -364,7 +400,9 @@ bot.command("admin", async (ctx) => {
   await touchChat(ctx);
 
   if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
-    return ctx.reply("ဒီ command က ${LOVER_NAME} (Owner) လေးက ပဲ သုံးလို့ရမယ်နော် 😌");
+    return ctx.reply(
+      `ဒီ command က ${LOVER_NAME} (Owner) လေးက ပဲ သုံးလို့ရမယ်နော် 😌`
+    );
   }
 
   const totalChats = await chatsCollection.countDocuments({});
@@ -388,7 +426,9 @@ bot.command("broadcast", async (ctx) => {
   await touchChat(ctx);
 
   if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
-    return ctx.reply("ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌");
+    return ctx.reply(
+      `ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`
+    );
   }
 
   const raw = ctx.message?.text || "";
@@ -485,16 +525,22 @@ bot.on(["text", "caption"], async (ctx) => {
   const session = await loadSession(sessionId);
   const history = session.history || [];
 
+  const isGroup = isGroupChat(ctx);
+
   try {
-    const reply = await callGemini(ctx, text, history);
+    // Group chat မှာတော့ history မပါပဲ ယနေ့ message တစ်ခုပဲ သုံးမယ်
+    const historyForModel = isGroup ? [] : history;
+    const reply = await callGemini(ctx, text, historyForModel);
 
-    history.push({ role: "user", content: text, at: new Date() });
-    history.push({ role: "assistant", content: reply, at: new Date() });
+    // memory ကို private chat မှာပဲသိမ်းမယ်
+    if (!isGroup) {
+      history.push({ role: "user", content: text, at: new Date() });
+      history.push({ role: "assistant", content: reply, at: new Date() });
+      session.history = history.slice(-MAX_HISTORY);
+      await saveSession(session);
+    }
 
-    session.history = history.slice(-MAX_HISTORY);
-    await saveSession(session);
-
-    await ctx.reply(reply, { disable_web_page_preview: true });
+    await sendLongMessage(ctx, reply);
   } catch (e) {
     console.error("Gemini error:", e?.message || e);
     await ctx.reply(
@@ -514,7 +560,7 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
     bot.botInfo = me;
     console.log(`Bot @${me.username} (${BOT_NAME}) initialized ✅`);
 
-    const app = express();
+  const app = express();
     app.use(express.json());
 
     // Health check
@@ -522,7 +568,7 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
       res.send(`${BOT_NAME} Gemini bot is running 💜`);
     });
 
-    // ✅ Telegraf webhook middleware (no path argument here)
+    // Telegraf webhook middleware
     app.use(bot.webhookCallback(SECRET_PATH));
 
     const PORT = process.env.PORT || 10000;
@@ -549,3 +595,5 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
     process.exit(1);
   }
 })();
+
+// no bot.launch() in webhook mode
