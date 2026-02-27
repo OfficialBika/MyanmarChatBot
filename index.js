@@ -1,5 +1,12 @@
-// Nora AI Girl Bot — Gemini + MongoDB + Webhook (Render friendly)
-// ---------------------------------------------------------------
+// Nora AI Girl Bot — Gemini + MongoDB + Webhook (Render friendly) — FINAL
+// ---------------------------------------------------------------------
+// ✅ Webhook (Render) + Healthcheck /
+// ✅ Gemini 2.5 Flash-Lite (AI)
+// ✅ MongoDB: sessions (memory for private only) + chats (for broadcast)
+// ✅ Group: reply ONLY if (1) reply-to Nora OR (2) mention @bot OR (3) says "Nora"
+// ✅ Group: cleans prompt (removes Nora/@bot prefix) => more natural replies
+// ✅ Long message splitter (Telegram 4096 cut proof)
+// ✅ /admin + /broadcast (owner only)
 
 require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
@@ -18,16 +25,14 @@ if (!MONGODB_URI) throw new Error("Missing MONGODB_URI in .env");
 const BOT_NAME = process.env.BOT_NAME || "Nora";
 const LOVER_NAME = process.env.LOVER_NAME || "Bika";
 
-const OWNER_ID =
-  parseInt(process.env.OWNER_ID || "0", 10) &&
-  parseInt(process.env.OWNER_ID || "0", 10) > 0
-    ? parseInt(process.env.OWNER_ID, 10)
-    : null;
+const OWNER_ID = (() => {
+  const n = parseInt(process.env.OWNER_ID || "0", 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+})();
 
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "nora_bot";
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || "sessions";
-const MONGODB_CHATS_COLLECTION =
-  process.env.MONGODB_CHATS_COLLECTION || "chats";
+const MONGODB_CHATS_COLLECTION = process.env.MONGODB_CHATS_COLLECTION || "chats";
 
 const MAX_HISTORY = clampInt(process.env.MAX_HISTORY, 16, 4, 40);
 const GROUP_REPLY_ONLY_WHEN_MENTIONED =
@@ -36,13 +41,13 @@ const GROUP_REPLY_ONLY_WHEN_MENTIONED =
 const WEBHOOK_DOMAIN = (process.env.WEBHOOK_DOMAIN || "").replace(/\/+$/, ""); // no trailing slash
 
 // ===== GEMINI CONFIG =====
-const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_ENDPOINT =
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-// ===== CORE OBJECTS =====
+// ===== CORE =====
 const bot = new Telegraf(BOT_TOKEN);
 
+// ===== MONGO =====
 const mongoClient = new MongoClient(MONGODB_URI, { maxPoolSize: 10 });
 let sessionsCollection;
 let chatsCollection;
@@ -89,32 +94,66 @@ async function setTyping(ctx) {
   } catch (_) {}
 }
 
-// group reply logic: mention @username OR say "Nora"
+/**
+ * Group policy:
+ * - Reply only if:
+ *   (1) user replied to Nora message
+ *   (2) user mentioned @botusername
+ *   (3) user wrote "Nora ..."
+ * - Otherwise ignore all group chats.
+ */
 function shouldReplyInGroup(ctx, text) {
   if (!isGroupChat(ctx)) return true;
 
+  // (1) reply to Nora message ONLY
   const replyTo = ctx.message?.reply_to_message;
-  if (replyTo && replyTo.from && replyTo.from.is_bot) return true;
+  if (replyTo && replyTo.from && ctx.botInfo && replyTo.from.id === ctx.botInfo.id) {
+    return true;
+  }
 
   const me = ctx.botInfo?.username;
   const lower = (text || "").toLowerCase();
 
-  // 1) mention
+  // (2) mention @bot
   if (me && lower.includes("@" + me.toLowerCase())) return true;
 
-  // 2) name call: "nora"
+  // (3) name call "Nora"
   if (BOT_NAME && lower.includes(BOT_NAME.toLowerCase())) return true;
 
-  // 3) config allow all
+  // (optional) allow all in group if env says so
   if (!GROUP_REPLY_ONLY_WHEN_MENTIONED) return true;
 
   return false;
 }
 
-// ===== Rate limit (simple in-memory) =====
+/**
+ * Clean group prompt:
+ * - remove @botusername
+ * - remove leading "Nora" call
+ * - if empty => default greeting
+ */
+function cleanGroupPrompt(ctx, text) {
+  let t = (text || "").trim();
+  if (!t) return t;
+
+  const me = ctx.botInfo?.username;
+  if (me) {
+    const re = new RegExp("@" + me + "\\b", "ig");
+    t = t.replace(re, "").trim();
+  }
+
+  const bn = (BOT_NAME || "Nora").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  t = t.replace(new RegExp("^" + bn + "\\b[\\s,:-]*", "i"), "").trim();
+
+  if (!t) t = "ဟယ်လို Nora လေး";
+  return t;
+}
+
+// ===== RATE LIMIT =====
 const rateState = new Map(); // userId -> { t: [], blockedUntil? }
 
 function rateLimitOk(userId) {
+  // max 6 msgs / 20s (simple anti-spam)
   const windowMs = 20_000;
   const limit = 6;
 
@@ -138,17 +177,18 @@ function rateLimitOk(userId) {
   return { ok: true };
 }
 
-// ===== Mongo Sessions / Chats =====
+// ===== MONGO: SESSIONS / CHATS =====
 async function initMongo() {
   await mongoClient.connect();
   const db = mongoClient.db(MONGODB_DB_NAME);
   sessionsCollection = db.collection(MONGODB_COLLECTION);
   chatsCollection = db.collection(MONGODB_CHATS_COLLECTION);
 
+  // TTL 30 days for sessions
   await sessionsCollection.createIndex(
     { updatedAt: 1 },
     { expireAfterSeconds: 60 * 60 * 24 * 30 }
-  ); // 30 days TTL
+  );
 
   await chatsCollection.createIndex({ lastSeen: 1 });
   console.log("MongoDB connected ✅");
@@ -161,7 +201,6 @@ function getSessionId(ctx) {
 }
 
 async function loadSession(sessionId) {
-  if (!sessionsCollection) return { _id: sessionId, history: [] };
   const doc = await sessionsCollection.findOne({ _id: sessionId });
   if (!doc) return { _id: sessionId, history: [] };
   doc.history = doc.history || [];
@@ -169,7 +208,6 @@ async function loadSession(sessionId) {
 }
 
 async function saveSession(session) {
-  if (!sessionsCollection) return;
   session.updatedAt = new Date();
   await sessionsCollection.updateOne(
     { _id: session._id },
@@ -183,19 +221,14 @@ async function saveSession(session) {
   );
 }
 
-// chat list for /broadcast
 async function touchChat(ctx) {
-  if (!chatsCollection) return;
   const chat = ctx.chat;
   if (!chat || !chat.id) return;
 
-  const isGroup = chat.type === "group" || chat.type === "supergroup";
+  const group = chat.type === "group" || chat.type === "supergroup";
   let title = chat.title || "";
 
-  if (!isGroup) {
-    // private chat — use user name
-    title = getDisplayName(ctx);
-  }
+  if (!group) title = getDisplayName(ctx);
 
   await chatsCollection.updateOne(
     { _id: chat.id },
@@ -204,7 +237,7 @@ async function touchChat(ctx) {
       $set: {
         type: chat.type,
         title,
-        isGroup,
+        isGroup: group,
         lastSeen: new Date(),
       },
     },
@@ -212,19 +245,16 @@ async function touchChat(ctx) {
   );
 }
 
-// ===== LONG MESSAGE SENDER (avoid Telegram 4096 cut) =====
-const TELEGRAM_LIMIT = 3900; // little lower than 4096 for safety
+// ===== LONG MESSAGE SENDER (Telegram 4096 safe) =====
+const TELEGRAM_LIMIT = 3900;
 
 async function sendLongMessage(ctx, text, extra = {}) {
   if (!text) return;
-  let remaining = text.toString();
+  let remaining = String(text);
 
   while (remaining.length > 0) {
     if (remaining.length <= TELEGRAM_LIMIT) {
-      await ctx.reply(remaining, {
-        disable_web_page_preview: true,
-        ...extra,
-      });
+      await ctx.reply(remaining, { disable_web_page_preview: true, ...extra });
       break;
     }
 
@@ -236,24 +266,19 @@ async function sendLongMessage(ctx, text, extra = {}) {
     const chunk = remaining.slice(0, sliceIndex).trimEnd();
     remaining = remaining.slice(sliceIndex).trimStart();
 
-    if (chunk.length > 0) {
-      await ctx.reply(chunk, {
-        disable_web_page_preview: true,
-        ...extra,
-      });
-    }
+    if (chunk) await ctx.reply(chunk, { disable_web_page_preview: true, ...extra });
   }
 }
 
-// ===== Gemini =====
+// ===== GEMINI =====
 function buildSystemPrompt(ctx) {
   const userName = getDisplayName(ctx);
-  const isGroup = isGroupChat(ctx);
+  const group = isGroupChat(ctx);
   const isOwner = OWNER_ID && ctx.from && ctx.from.id === OWNER_ID;
 
   const relationshipLine = isOwner
     ? `${LOVER_NAME} (the current user) is your beloved boyfriend and the owner of this bot. Treat him extra sweet and caring, but still safe and non-explicit.`
-    : `${LOVER_NAME} is your beloved boyfriend and also the owner of this bot, but right now you are chatting with "${userName}". Be friendly and warm, but keep romantic tone lighter than with ${LOVER_NAME}.`;
+    : `${LOVER_NAME} is your beloved boyfriend and the owner of this bot. You are chatting with "${userName}". Be friendly and warm. Romantic tone is lighter than with ${LOVER_NAME}.`;
 
   return `
 You are ${BOT_NAME}, a cute Myanmar AI girl chatbot.
@@ -261,31 +286,30 @@ You are ${BOT_NAME}, a cute Myanmar AI girl chatbot.
 ${relationshipLine}
 
 STYLE:
-- Speak mostly in Burmese (Myanmar language), mix a bit of casual English.
-- Tone: warm, playful, friendly girlfriend style but respectful and non-explicit.
-- ALWAYS call the user by their Telegram name at least once in each reply.
-  For example: "Ko ${userName}", "${userName}လေး", etc. Choose naturally.
-- Use 0–3 emojis like 😄🥹✨.
-- In group chats, keep replies short (1–3 short paragraphs).
-- In private chats, you can be a bit more chatty (max 6 short paragraphs).
-- Often ask a small follow-up question in Burmese to keep the conversation alive.
+- Speak Burmese naturally (Myanmar). You may add 0–2 short English words only if natural.
+- No weird symbols, no random decorations, no repeated characters.
+- Reply must be meaningful and direct.
+- ALWAYS address the user by their Telegram name once (e.g., "Ko ${userName}", "${userName}လေး").
+- Group chats: 1–2 short paragraphs. Private chats: max 4 short paragraphs.
+- Use 0–2 emojis only.
+- If unclear, ask ONE short follow-up question.
 
 SAFETY:
-- Never produce explicit sexual content, pornographic details, self-harm instructions, or guidance for illegal/dangerous activities.
-- If the user requests something unsafe, gently refuse in Burmese and suggest safe topics instead.
+- Never produce explicit sexual content, pornographic details, self-harm instructions, or illegal/dangerous guidance.
+- If unsafe request, refuse politely in Burmese and offer safe alternative.
 
 CONTEXT:
-- This chat is a ${isGroup ? "group chat" : "private chat"}.
-- If user only calls your name (like "Nora" or "Nora?"), answer like a girlfriend greeting them by name and asking what's up.
+- This is a ${group ? "group chat" : "private chat"}.
+- If user just calls your name, greet them and ask what's up.
 `.trim();
 }
 
 async function callGemini(ctx, userText, history) {
   const systemPrompt = buildSystemPrompt(ctx);
-  const isGroup = isGroupChat(ctx);
+  const group = isGroupChat(ctx);
 
   const contents = [];
-  const limitedHistory = history.slice(-MAX_HISTORY);
+  const limitedHistory = (history || []).slice(-MAX_HISTORY);
 
   for (const m of limitedHistory) {
     const role = m.role === "assistant" ? "model" : "user";
@@ -296,115 +320,89 @@ async function callGemini(ctx, userText, history) {
 
   const body = {
     contents,
-    systemInstruction: {
-      role: "system",
-      parts: [{ text: systemPrompt }],
-    },
+    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
     generationConfig: {
-      temperature: 0.9,
-      maxOutputTokens: isGroup ? 260 : 380, // group မှာအဖြေတိုအောင်
-      topP: 0.95,
+      temperature: group ? 0.6 : 0.75,
+      topP: 0.9,
+      maxOutputTokens: group ? 220 : 320,
     },
   };
 
-  const res = await fetch(
-    `${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }
-  );
+  const res = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Gemini error ${res.status}: ${text.slice(0, 400)}`);
+    const t = await res.text().catch(() => "");
+    throw new Error(`Gemini error ${res.status}: ${t.slice(0, 500)}`);
   }
 
   const data = await res.json();
-  const cand = (data.candidates && data.candidates[0]) || null;
-  if (!cand || !cand.content || !cand.content.parts) {
-    return "ဟင်… Nora က သေချာမရေးနိုင်သေးလို့ တစ်ခါထပ်ရှင်းပြပေးပါနော်";
+  const cand = data?.candidates?.[0];
+  const parts = cand?.content?.parts;
+
+  if (!parts || !Array.isArray(parts)) {
+    return "ဟင်… Nora က မသေချာသေးလို့ နည်းနည်းထပ်ရှင်းပြပေးပါနော် 🥲";
   }
 
-  const reply = cand.content.parts
-    .map((p) => p.text || "")
-    .join("")
-    .trim();
-
-  return (
-    reply ||
-    "ဟယ်… Nora က စာမလုံးဝလက်ခံမရရှိသေးဘူးလို့ပဲ ထင်တယ် 😅 နောက်တစ်ခါ ထပ်ရိုက်ပို့ပေးပါအုံး။"
-  );
+  const reply = parts.map((p) => p.text || "").join("").trim();
+  return reply || "ဟယ်… Nora မရသေးလိုပဲ 😅 တစ်ခါထပ်ပြောပေးပါနော်။";
 }
 
-// ===== UI / COMMANDS =====
+// ===== UI =====
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback("💬 Chat with Nora", "MENU_CHAT"),
-      Markup.button.callback("🧠 Memory", "MENU_MEMORY"),
-    ],
-    [
-      Markup.button.callback("🧹 Clear Memory", "MENU_CLEAR"),
-      Markup.button.callback("ℹ️ Help", "MENU_HELP"),
-    ],
+    [Markup.button.callback("💬 Chat", "MENU_CHAT"), Markup.button.callback("🧠 Memory", "MENU_MEMORY")],
+    [Markup.button.callback("🧹 Clear", "MENU_CLEAR"), Markup.button.callback("ℹ️ Help", "MENU_HELP")],
   ]);
 }
 
 const HELP_TEXT = (username = "") =>
   `🧸 *${BOT_NAME} — Myanmar AI Girl Bot*
 
-Private chat:
-- စိတ်ကူးယဉ်ရည်းစားလို စကားပြောလို့ရတယ် 💙
-
-Group chat:
-- "Nora ..." လို့ နာမည်ခေါ်မယ် (သို့)
-- *@${username || "your_bot"}* လို့ mention လိုက်ရင် ပြန်ဖြေမယ်
+Group:
+- Nora ကို reply ထောက်ပြီးပြော (သို့) "Nora ..." လို့ခေါ် (သို့) *@${username || "your_bot"}* mention လုပ်
 
 Commands:
-/start — Main menu
-/help — How to use
-/clear — Clear memory (this chat only)
-/admin — Admin dashboard (owner only)
-/broadcast — Message to all chats (owner only)
+/start
+/help
+/clear
+/admin (owner)
+/broadcast (owner)
 `.trim();
 
-// /start
+// ===== COMMANDS =====
 bot.start(async (ctx) => {
   await touchChat(ctx);
   const name = getDisplayName(ctx);
-  const txt = `ဟယ်လို ${name} 👋  
-ကျမက *${BOT_NAME}* ပါ 💜  
-${LOVER_NAME} ရည်းစားလေးလည်း ဖြစ်တယ် 😏
+  const msg =
+    `ဟယ်လို ${name} 👋\n` +
+    `ကျမက *${BOT_NAME}* ပါ 💜\n` +
+    `${LOVER_NAME} ရည်းစားလေးလည်း ဖြစ်တယ် 😏\n\n` +
+    `Group မှာတော့ Nora ကို reply ထောက်ပြီးပြော၊ ဒါမှမဟုတ် "Nora ..." လို့ခေါ်ပေးနော်။`;
 
-Private chat မှာတော့ စိတ်တိုင်းမကျမလား စကားပြောလို့ရတယ်…
-Group မှာဆိုရင် "Nora" လို့နာမည်ခေါ်ပေးမယ်၊ ဒါမှမဟုတ် *@${ctx.botInfo.username}* ကို mention လုပ်ပေးရင် ပြန်ဖြေပေးမယ်နော်။`;
-
-  await ctx.replyWithMarkdown(txt, mainMenu());
+  await ctx.replyWithMarkdown(msg, mainMenu());
 });
 
 bot.command("help", async (ctx) => {
   await touchChat(ctx);
-  const h = HELP_TEXT(ctx.botInfo?.username || "");
-  await ctx.replyWithMarkdown(h, mainMenu());
+  await ctx.replyWithMarkdown(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
 });
 
 bot.command("clear", async (ctx) => {
   await touchChat(ctx);
   const sessionId = getSessionId(ctx);
   await saveSession({ _id: sessionId, history: [] });
-  await ctx.reply("🧹 ဒီ chat အတွက် Nora memory ကို အကုန်ဖျက်လိုက်ပြီနော် 💙");
+  await ctx.reply("🧹 ဒီ chat အတွက် memory ကို ဖျက်ပြီးပြီနော် 💙");
 });
 
 // /admin — owner only
 bot.command("admin", async (ctx) => {
   await touchChat(ctx);
-
   if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
-    return ctx.reply(
-      `ဒီ command က ${LOVER_NAME} (Owner) လေးက ပဲ သုံးလို့ရမယ်နော် 😌`
-    );
+    return ctx.reply(`ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`);
   }
 
   const totalChats = await chatsCollection.countDocuments({});
@@ -415,10 +413,8 @@ bot.command("admin", async (ctx) => {
   const msg =
     `👑 *${BOT_NAME} Admin Dashboard*\n\n` +
     `Owner: ${LOVER_NAME} (ID: ${OWNER_ID})\n\n` +
-    `Chats: ${totalChats}\n` +
-    `- Private: ${privateChats}\n` +
-    `- Groups: ${groupChats}\n\n` +
-    `Memory docs (sessions): ${sessionsCount}`;
+    `Chats: ${totalChats}\n- Private: ${privateChats}\n- Groups: ${groupChats}\n\n` +
+    `Sessions (memory docs): ${sessionsCount}`;
 
   await ctx.replyWithMarkdown(msg);
 });
@@ -426,21 +422,15 @@ bot.command("admin", async (ctx) => {
 // /broadcast — owner only
 bot.command("broadcast", async (ctx) => {
   await touchChat(ctx);
-
   if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
-    return ctx.reply(
-      `ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`
-    );
+    return ctx.reply(`ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`);
   }
 
   const raw = ctx.message?.text || "";
   const cleaned = raw.replace(/\/broadcast(@\w+)?/i, "").trim();
 
   if (!cleaned) {
-    return ctx.reply(
-      "Broadcast စာကို `/broadcast` အောက်ကလို သုံးပါနော်:\n\n" +
-        "/broadcast မင်္ဂလာပါ Nora fan တွေ 🌸"
-    );
+    return ctx.reply("သုံးပုံ: /broadcast မင်္ဂလာပါ Nora fan တွေ 🌸");
   }
 
   const message = `📢 *${BOT_NAME} Broadcast*\n\n${cleaned}`;
@@ -457,23 +447,19 @@ bot.command("broadcast", async (ctx) => {
         disable_web_page_preview: true,
       });
       sent++;
-    } catch (err) {
+    } catch (_) {
       failed++;
     }
   }
 
-  await ctx.reply(
-    `Broadcast ပြီးပါပြီ ✅\n\nပို့နိုင်သမျှ: ${sent}\nပျက်သွားသမျှ: ${failed}`
-  );
+  await ctx.reply(`Broadcast ✅\nSent: ${sent}\nFailed: ${failed}`);
 });
 
-// Inline menu actions
+// Menu actions
 bot.action("MENU_CHAT", async (ctx) => {
   await ctx.answerCbQuery();
   await touchChat(ctx);
-  await ctx.reply(
-    "Chat mode ✅ စိတ်ပါထဲမှာ ပါတာနဲ့ပဲ ရိုက်ပို့လိုက်… Nora က နာမည်ခေါ်ပြီး ပြန်စကားပြောမယ်နော် 😌"
-  );
+  await ctx.reply("OK 😊 စကားပြောလိုက်နော်—Nora ပြန်ဖြေပေးမယ် 💜");
 });
 
 bot.action("MENU_MEMORY", async (ctx) => {
@@ -481,10 +467,7 @@ bot.action("MENU_MEMORY", async (ctx) => {
   await touchChat(ctx);
   const sessionId = getSessionId(ctx);
   const s = await loadSession(sessionId);
-  const n = s.history?.length || 0;
-  await ctx.reply(
-    `🧠 ဒီ chat အတွက် Memory items ${n} ခုရှိနေတယ်\nမကြိုက်ရင် /clear နဲ့ ဖျက်လို့ရတယ် 😊`
-  );
+  await ctx.reply(`🧠 Memory items: ${s.history?.length || 0}`);
 });
 
 bot.action("MENU_CLEAR", async (ctx) => {
@@ -492,50 +475,52 @@ bot.action("MENU_CLEAR", async (ctx) => {
   await touchChat(ctx);
   const sessionId = getSessionId(ctx);
   await saveSession({ _id: sessionId, history: [] });
-  await ctx.reply("OK နော် 🧹 Memory ကို ဖျက်ပေးထားတယ်");
+  await ctx.reply("Memory cleared ✅");
 });
 
 bot.action("MENU_HELP", async (ctx) => {
   await ctx.answerCbQuery();
   await touchChat(ctx);
-  const h = HELP_TEXT(ctx.botInfo?.username || "");
-  await ctx.replyWithMarkdown(h, mainMenu());
+  await ctx.replyWithMarkdown(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
 });
 
-// ===== MAIN MESSAGE HANDLER =====
+// ===== MAIN HANDLER =====
 bot.on(["text", "caption"], async (ctx) => {
   await touchChat(ctx);
 
   const userId = getUserId(ctx);
   if (!userId) return;
 
-  const text = extractText(ctx);
-  if (!text) return;
+  const rawText = extractText(ctx);
+  if (!rawText) return;
 
-  if (!shouldReplyInGroup(ctx, text)) return;
+  // group filter
+  if (!shouldReplyInGroup(ctx, rawText)) return;
 
+  // rate limit
   const rl = rateLimitOk(userId);
-  if (!rl.ok) {
-    return ctx.reply(
-      "နည်းနည်းအေးအေးနားပေးမယ်နော် 😅 နောက်ထပ်မေးချင်ရင် Nora ပြန်ဖြေမယ်"
-    );
-  }
+  if (!rl.ok) return;
 
   await setTyping(ctx);
 
+  const group = isGroupChat(ctx);
+
+  // prompt cleanup for group
+  const text = group ? cleanGroupPrompt(ctx, rawText) : rawText;
+
+  // load session (for private memory only)
   const sessionId = getSessionId(ctx);
   const session = await loadSession(sessionId);
   const history = session.history || [];
 
-  const isGroup = isGroupChat(ctx);
-
   try {
-    // Group chat မှာတော့ history မပါပဲ ယနေ့ message တစ်ခုပဲ သုံးမယ်
-    const historyForModel = isGroup ? [] : history;
+    // Group uses AI too, but no memory/history to avoid reading group chats
+    const historyForModel = group ? [] : history;
+
     const reply = await callGemini(ctx, text, historyForModel);
 
-    // memory ကို private chat မှာပဲသိမ်းမယ်
-    if (!isGroup) {
+    // Save memory only in private chats
+    if (!group) {
       history.push({ role: "user", content: text, at: new Date() });
       history.push({ role: "assistant", content: reply, at: new Date() });
       session.history = history.slice(-MAX_HISTORY);
@@ -545,14 +530,12 @@ bot.on(["text", "caption"], async (ctx) => {
     await sendLongMessage(ctx, reply);
   } catch (e) {
     console.error("Gemini error:", e?.message || e);
-    await ctx.reply(
-      "အင်း… Nora ဘက်က error နည်းနည်းဖြစ်သွားတယ် 🥲\nNetwork ပြန်မြင့်ရင် နောက်တစ်ခါထပ်စမ်းပေးပါနော်။"
-    );
+    await ctx.reply("အင်း… Nora ဘက်က error နည်းနည်းဖြစ်သွားတယ် 🥲 နောက်တစ်ခါထပ်စမ်းပေးပါနော်။");
   }
 });
 
 // ===== WEBHOOK SERVER (Render) =====
-const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
+const SECRET_PATH = `/telegraf/${BOT_TOKEN}`;
 
 (async () => {
   try {
@@ -562,15 +545,14 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
     bot.botInfo = me;
     console.log(`Bot @${me.username} (${BOT_NAME}) initialized ✅`);
 
-  const app = express();
+    const app = express();
     app.use(express.json());
 
-    // Health check
     app.get("/", (req, res) => {
       res.send(`${BOT_NAME} Gemini bot is running 💜`);
     });
 
-    // Telegraf webhook middleware
+    // IMPORTANT: no path arg here
     app.use(bot.webhookCallback(SECRET_PATH));
 
     const PORT = process.env.PORT || 10000;
@@ -578,24 +560,16 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
       console.log(`HTTP server listening on port ${PORT} ✅`);
 
       if (!WEBHOOK_DOMAIN) {
-        console.warn(
-          "WEBHOOK_DOMAIN not set in .env — please configure it so Telegram can reach your bot."
-        );
+        console.warn("WEBHOOK_DOMAIN not set in .env");
         return;
       }
 
       const hookUrl = WEBHOOK_DOMAIN + SECRET_PATH;
-      try {
-        await bot.telegram.setWebhook(hookUrl);
-        console.log(`Webhook set to ${hookUrl} ✅`);
-      } catch (err) {
-        console.error("Failed to set webhook:", err?.message || err);
-      }
+      await bot.telegram.setWebhook(hookUrl);
+      console.log(`Webhook set to ${hookUrl} ✅`);
     });
   } catch (e) {
     console.error("Startup error:", e);
     process.exit(1);
   }
 })();
-
-// no bot.launch() in webhook mode
