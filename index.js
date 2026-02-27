@@ -286,7 +286,7 @@ async function callGemini(ctx, userText, history) {
   const data = await res.json();
   const cand = (data.candidates && data.candidates[0]) || null;
   if (!cand || !cand.content || !cand.content.parts) {
-    return "ဟင်… Nora က သေချာမရေးနိုင်သေးလို့ တစ်ခါထပ်ရှင်းပြပေးပါနော် 🥲";
+    return "ဟင်… Nora က သေချာမရေးနိုင်သေးလို့ တစ်ခါထပ်ရှင်းပြပေးပါနော်";
   }
 
   const reply = cand.content.parts
@@ -296,7 +296,7 @@ async function callGemini(ctx, userText, history) {
 
   return (
     reply ||
-    "ဟယ်… Nora က စာမလုံးဝမရသေးလို့ပဲ ထင်တယ် 😅 နောက်တစ်ခါ ထပ်ရိုက်ပို့ပေးပါအုံး။"
+    "ဟယ်… Nora က စာမလုံးဝလက်ခံမရရှိသေးဘူးလို့ပဲ ထင်တယ် 😅 နောက်တစ်ခါ ထပ်ရိုက်ပို့ပေးပါအုံး။"
   );
 }
 
@@ -517,11 +517,13 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
     const app = express();
     app.use(express.json());
 
+    // Health check
     app.get("/", (req, res) => {
       res.send(`${BOT_NAME} Gemini bot is running 💜`);
     });
 
-    app.use(SECRET_PATH, bot.webhookCallback(SECRET_PATH));
+    // ✅ Telegraf webhook middleware (no path argument here)
+    app.use(bot.webhookCallback(SECRET_PATH));
 
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, async () => {
@@ -547,5 +549,3 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`; // random enough
     process.exit(1);
   }
 })();
-
-// no bot.launch() in webhook mode
