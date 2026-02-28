@@ -549,7 +549,7 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`;
 
     // ✅ Correct: mount ONLY at SECRET_PATH
     app.use(SECRET_PATH, bot.webhookCallback(SECRET_PATH));
-
+    
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, async () => {
       console.log(`HTTP server listening on port ${PORT} ✅`);
