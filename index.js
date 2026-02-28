@@ -1,30 +1,27 @@
-// Nora AI Girl Bot — Gemini + MongoDB + Webhook (Render friendly) — FINAL (AI + Templates + MLBB Data)
-// --------------------------------------------------------------------------------------------------
-// ✅ Webhook (Render) correct mount
-// ✅ Group: reply ONLY if (reply to Nora) OR (mention @bot) OR (name-call "Nora")
+// Nora AI Girl Bot — Gemini + MongoDB + Webhook (Render) — FINAL
+// --------------------------------------------------------------
+// ✅ Webhook (Render) correct mount (app.post + express.json only on SECRET_PATH)
+// ✅ Group: reply ONLY if (reply-to Nora) OR (mention @bot) OR (name-call "Nora")
 // ✅ Mongo memory: per chat-user session
 // ✅ Long message splitter (avoid Telegram 4096 cut)
 // ✅ Fallback Templates (templates.js) when Gemini quota/error OR AI_MODE=off
 // ✅ /admin + /broadcast (Owner only) + chat registry for broadcast
 //
-// Required files:
+// Required files (same folder):
 // - index.js
-// - templates.js (the FINAL one I sent)
-// - data/hero-meta-final.txt
-// - data/item-meta-final.txt
-// - data/emblem-meta-final.txt
+// - templates.js
 //
 // .env required:
 // BOT_TOKEN=...
 // MONGODB_URI=...
 // WEBHOOK_DOMAIN=https://your-service.onrender.com
 // Optional:
-// GEMINI_API_KEY=... (if you want AI on)
-// AI_MODE=auto|off        (default: auto)
+// GEMINI_API_KEY=...       (for AI mode)
+// AI_MODE=auto|off         (default: auto)
 // GEMINI_MODEL=gemini-2.5-flash-lite (default)
 // BOT_NAME=Nora
 // LOVER_NAME=Bika
-// OWNER_ID=123456789      (for /admin, /broadcast)
+// OWNER_ID=123456789       (for /admin, /broadcast)
 // GROUP_REPLY_ONLY_WHEN_MENTIONED=true
 // MAX_HISTORY=16
 // MONGODB_DB_NAME=nora_bot
@@ -200,7 +197,10 @@ async function initMongo() {
   chatsCollection = db.collection(MONGODB_CHATS_COLLECTION);
 
   // sessions TTL 30 days
-  await sessionsCollection.createIndex({ updatedAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 30 });
+  await sessionsCollection.createIndex(
+    { updatedAt: 1 },
+    { expireAfterSeconds: 60 * 60 * 24 * 30 }
+  );
   await chatsCollection.createIndex({ lastSeen: 1 });
 
   console.log("MongoDB connected ✅");
@@ -521,7 +521,7 @@ bot.on(["text", "caption"], async (ctx) => {
 
     await sendLongMessage(ctx, reply, replyExtra);
   } catch (e) {
-    // Fallback to templates (very important for quota 429 / billing issues)
+    // Fallback to templates (for quota 429 / billing issues)
     console.error("AI error, fallback to template:", e?.message || e);
 
     const fb = templateReply(text, { userName: getDisplayName(ctx), isGroup });
@@ -541,15 +541,15 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`;
     console.log(`Bot @${me.username} (${BOT_NAME}) initialized ✅`);
 
     const app = express();
-    app.use(express.json());
 
+    // health check
     app.get("/", (req, res) => {
       res.send(`${BOT_NAME} is running ✅ | AI_MODE=${AI_MODE} | model=${GEMINI_MODEL}`);
     });
 
-    // ✅ Correct: mount ONLY at SECRET_PATH
-    app.use(SECRET_PATH, bot.webhookCallback(SECRET_PATH));
-    
+    // Telegram webhook — ONLY here we use express.json()
+    app.post(SECRET_PATH, express.json(), bot.webhookCallback(SECRET_PATH));
+
     const PORT = process.env.PORT || 10000;
     app.listen(PORT, async () => {
       console.log(`HTTP server listening on port ${PORT} ✅`);
