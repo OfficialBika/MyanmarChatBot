@@ -63,7 +63,7 @@ let chatsCollection;
 function clampInt(v, def, min, max) {
   const n = parseInt(v, 10);
   if (!Number.isFinite(n)) return def;
-  return Math.max(min, Mathmin(max, n));
+  return Math.max(min, Math.min(max, n));
 }
 
 // =====================
