@@ -1,5 +1,28 @@
 /**
- * Nora AI Girl Bot — FINAL
+ * Nora AI Girl Bot — FINAL (ARQ Luna ONLY) + MongoDB + Webhook (Render) + Admin Dashboard (Buttons)
+ * ------------------------------------------------------------------------------------------------
+ * ✅ Webhook correct mount (Render): app.post(SECRET_PATH, express.json(), bot.webhookCallback())
+ * ✅ Group reply gate: reply-to bot OR @mention OR "Nora" name-call
+ * ✅ Private: reply to everything
+ * ✅ AI: ARQ Luna ONLY (X-API-KEY) + Myanmar-forcing prompt
+ * ✅ /admin dashboard (owner only) + Users list + Groups list + Uptime (buttons + pagination)
+ * ✅ /broadcast (owner only) + chat registry
+ * ✅ Long message splitting (Telegram 4096 safe)
+ *
+ * Required ENV:
+ * - BOT_TOKEN
+ * - MONGODB_URI
+ * - WEBHOOK_DOMAIN (e.g. https://your-service.onrender.com)
+ * - OWNER_ID
+ * - ARQ_API_KEY
+ *
+ * Optional ENV:
+ * - ARQ_API_URL (default https://thearq.tech)
+ * - BOT_NAME (default Nora)
+ * - LOVER_NAME (default Bika)
+ * - AI_MODE (auto|off) default auto
+ * - MAX_HISTORY (default 14)
+ * - GROUP_REPLY_ONLY_WHEN_MENTIONED (true|false) default true
  */
 
 "use strict";
@@ -66,44 +89,9 @@ function clampInt(v, def, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-// =====================
-// ADMIN UI (Uptime + Pagination)Halper
-// =====================
-const STARTED_AT = Date.now();
-
-function formatUptime(ms) {
-  const s = Math.floor(ms / 1000);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  const parts = [];
-  if (d) parts.push(`${d}d`);
-  if (h) parts.push(`${h}h`);
-  if (m) parts.push(`${m}m`);
-  parts.push(`${ss}s`);
-  return parts.join(" ");
-}
-
 function isOwner(ctx) {
   return !!OWNER_ID && ctx.from?.id === OWNER_ID;
 }
-
-function adminMenu() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("👤 Users List", "ADMIN_USERS:0"), Markup.button.callback("👥 Group List", "ADMIN_GROUPS:0")],
-    [Markup.button.callback("⏱ Uptime", "ADMIN_UPTIME"), Markup.button.callback("🔄 Refresh", "ADMIN_REFRESH")],
-  ]);
-}
-
-function pagerButtons(kind, page, hasPrev, hasNext) {
-  const row = [];
-  if (hasPrev) row.push(Markup.button.callback("⬅️ Prev", `ADMIN_${kind}:${page - 1}`));
-  row.push(Markup.button.callback("🏠 Admin", "ADMIN_HOME"));
-  if (hasNext) row.push(Markup.button.callback("Next ➡️", `ADMIN_${kind}:${page + 1}`));
-  return Markup.inlineKeyboard([row]);
-}
-
 
 function isGroupChat(ctx) {
   const t = ctx.chat?.type;
@@ -164,14 +152,14 @@ async function sendLongMessage(ctx, text, extra = {}) {
   }
 }
 
-// Group gate: reply-to Nora OR @mention OR name-call "Nora"
+// Group gate: reply-to bot OR @mention OR name-call "Nora"
 function shouldReplyInGroup(ctx, text) {
   if (!isGroupChat(ctx)) return true;
 
   const lower = (text || "").toLowerCase();
   const meUsername = ctx.botInfo?.username ? ctx.botInfo.username.toLowerCase() : "";
 
-  // (1) reply-to Nora (same bot id)
+  // (1) reply-to bot
   const replyTo = ctx.message?.reply_to_message;
   if (replyTo && replyTo.from && ctx.botInfo && replyTo.from.id === ctx.botInfo.id) return true;
 
@@ -225,6 +213,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 25_000) {
   }
 }
 
+// Retryable errors
 function isRetryableError(msg = "") {
   const m = String(msg).toLowerCase();
   return (
@@ -235,7 +224,8 @@ function isRetryableError(msg = "") {
     m.includes("network") ||
     m.includes("resource_exhausted") ||
     m.includes("aborted") ||
-    m.includes("econnreset")
+    m.includes("econnreset") ||
+    m.includes("fetch failed")
   );
 }
 
@@ -314,19 +304,18 @@ async function touchChat(ctx) {
 function buildArqPrompt(ctx, userText) {
   const userName = getDisplayName(ctx);
   const group = isGroupChat(ctx);
-  const isOwner = OWNER_ID && ctx.from?.id === OWNER_ID;
+  const owner = OWNER_ID && ctx.from?.id === OWNER_ID;
 
   const style =
-    (isOwner
-      ? `သူ့ရည်းစား ${LOVER_NAME} (Owner) လေးနဲ့ စကားပြောနေတဲ့ Nora လို သဘောကျလို့ရအောင် ပိုနွေးထွေးပြီး caring ဖြစ်ပါ။`
-      : `မိမိကို "${userName}" လို့ခေါ်ပြီး နွေးထွေးဖော်ရွေကူညီပေးပါ။ Romatic tone ကို LIGHT ပဲထားပါ။`) +
-    (group ? ` Group ထဲဆို အဓိပ္ပါယ်ရှိရှိ နဲ့  (၈လိုင်းကျော်မကျော်) ပဲဖြေပါ။` : ` Private ထဲဆို အသေးစိတ်နည်းနဲ့ဖြေရပါမယ်။`);
+    (owner
+      ? `သင့်ရည်းစား ${LOVER_NAME} (Owner) လေးနဲ့ စကားပြောနေတဲ့ Nora လို ပိုနွေးထွေးပြီး caring ဖြစ်ပါ။`
+      : `မိမိကို "${userName}" လို့ခေါ်ပြီး နွေးထွေးဖော်ရွေကူညီပေးပါ။ Romantic tone ကို LIGHT ပဲထားပါ။`) +
+    (group ? ` Group ထဲဆို တိုတိုတင်းတင်း (၈လိုင်းကျော်မကျော်) ပဲဖြေပါ။` : ` Private ထဲဆို အသေးစိတ်နည်းနည်းဖြေရပါမယ်။`);
 
-  // Myanmar-only hint + quality rules
   return [
     `အောက်က user message ကို "မြန်မာလိုပဲ" သဘာဝကျကျ ပြန်ဖြေပါ။`,
     `0–2 emoji ပဲသုံးပါ။`,
-    `အဓိပ္ပါယ်ရှိအောင် တစ်ကြိမ်တည်းနဲ့တိတိကျကျ ဖြေပါ။`,
+    `အဓိပ္ပါယ်ရှိအောင် တစ်ကြိမ်တည်းနဲ့ တိတိကျကျ ဖြေပါ။`,
     style,
     ``,
     `User: ${userText}`,
@@ -334,14 +323,10 @@ function buildArqPrompt(ctx, userText) {
 }
 
 async function callARQLuna(ctx, userText) {
-  if (!ARQ_API_KEY) throw new Error("ARQ_API_KEY not set");
-
   const userId = getUserId(ctx) || 0;
   const prompt = buildArqPrompt(ctx, userText);
 
-  const url = `${ARQ_API_URL}/luna?query=${encodeURIComponent(prompt)}&id=${encodeURIComponent(
-    userId
-  )}`;
+  const url = `${ARQ_API_URL}/luna?query=${encodeURIComponent(prompt)}&id=${encodeURIComponent(userId)}`;
 
   const res = await fetchWithTimeout(
     url,
@@ -349,7 +334,7 @@ async function callARQLuna(ctx, userText) {
       method: "GET",
       headers: { "X-API-KEY": ARQ_API_KEY },
     },
-    25_000
+    35_000
   );
 
   if (!res.ok) {
@@ -364,28 +349,19 @@ async function callARQLuna(ctx, userText) {
 
 async function generateReply(ctx, text) {
   if (AI_MODE === "off") {
-    return (
-      `အင်း… ${getDisplayName(ctx)} လေး 🥹\n` +
-      `Nora က AI ကို ပိတ်ထားတယ်နော်။ AI_MODE=auto ပြန်ဖွင့်ရင် ပြန်ပြောနိုင်မယ် 💜`
-    );
+    return `အင်း… ${getDisplayName(ctx)} လေး 🥹\nNora က AI ကို ပိတ်ထားတယ်နော်။ပြန်ဖွင့်ရင် ပြန်ပြောနိုင်မယ် 💜`;
   }
 
-  // ARQ-only (with soft retry if retryable)
   try {
     return await callARQLuna(ctx, text);
   } catch (e) {
     if (isRetryableError(e?.message || e)) {
-      // one quick retry
       try {
         return await callARQLuna(ctx, text);
       } catch (_) {}
     }
     console.error("ARQ failed:", e?.message || e);
-    return (
-      `အင်း… ${getDisplayName(ctx)} လေး 🥲\n` +
-      `Nora ရဲ့ AI ဘက်မှာ temporary error ဖြစ်နေတယ်။\n` +
-      `ခဏနောက်တစ်ခါ ထပ်ပို့ပေးပါနော် 💜`
-    );
+    return `အင်း… ${getDisplayName(ctx)} လေး 🥲\nNora ရဲ့ AI ဘက်မှာ temporary error ဖြစ်နေတယ်။\nနောက်တစ်ခါ ထပ်ပို့ပေးပါနော် 💜`;
   }
 }
 
@@ -394,29 +370,71 @@ async function generateReply(ctx, text) {
 // =====================
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("💬 Chat with Nora", "MENU_CHAT"), Markup.button.callback("🧠 Memory", "MENU_MEMORY")],
-    [Markup.button.callback("🧹 Clear Memory", "MENU_CLEAR"), Markup.button.callback("ℹ️ Help", "MENU_HELP")],
+    [
+      Markup.button.callback("💬 Chat with Nora", "MENU_CHAT"),
+      Markup.button.callback("🧠 Memory", "MENU_MEMORY"),
+    ],
+    [
+      Markup.button.callback("🧹 Clear Memory", "MENU_CLEAR"),
+      Markup.button.callback("ℹ️ Help", "MENU_HELP"),
+    ],
   ]);
 }
 
 const HELP_TEXT = (username = "") =>
-  `🧸 *${BOT_NAME} — Myanmar AI Girl Bot (ARQ Only)*
+  `🧸 ${BOT_NAME} — Myanmar AI Girl Bot (ARQ Only)
 
 Private chat:
 - သဘာဝကျကျ စကားပြောလို့ရတယ် 💜
 
 Group chat:
-- Nora ကို *reply* ထောက်ပြီးပြော (သို့)
+- Nora ကို reply ထောက်ပြီးပြော (သို့)
 - "${BOT_NAME} ..." လို့ခေါ် (သို့)
-- *@${username || "your_bot"}* mention လုပ်
+- @${username || "your_bot"} mention လုပ်
 
 Owner:
 - /admin
 - /broadcast <message>
 
 Other:
-/clear — clear memory
-`.trim();
+/clear — clear memory`;
+
+// =====================
+// ADMIN UI (Uptime + Pagination) — NO MARKDOWN (avoid Telegram parse issues)
+// =====================
+const STARTED_AT = Date.now();
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  parts.push(`${ss}s`);
+  return parts.join(" ");
+}
+
+function adminMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("👤 Users List", "ADMIN_USERS:0"),
+      Markup.button.callback("👥 Group List", "ADMIN_GROUPS:0"),
+    ],
+    [Markup.button.callback("⏱ Uptime", "ADMIN_UPTIME"), Markup.button.callback("🔄 Refresh", "ADMIN_REFRESH")],
+  ]);
+}
+
+function pagerButtons(kind, page, hasPrev, hasNext) {
+  const row = [];
+  if (hasPrev) row.push(Markup.button.callback("⬅️ Prev", `ADMIN_${kind}:${page - 1}`));
+  row.push(Markup.button.callback("🏠 Admin", "ADMIN_HOME"));
+  if (hasNext) row.push(Markup.button.callback("Next ➡️", `ADMIN_${kind}:${page + 1}`));
+  return Markup.inlineKeyboard([row]);
+}
 
 // =====================
 // COMMANDS
@@ -426,17 +444,17 @@ bot.start(async (ctx) => {
   const name = getDisplayName(ctx);
   const txt =
     `ဟယ်လို ${name} 👋\n` +
-    `ကျမက *${BOT_NAME}* ပါ 💜\n` +
-    `${LOVER_NAME} ရည်းစားလေးလည်း ဖြစ်တယ် 😏\n\n` +
-    `Private မှာတော့ အကုန်စကားပြောလို့ရတယ်…\n` +
+    `ကျမက ${BOT_NAME} ပါ 💜\n` +
+    `${LOVER_NAME} က Nora ရည်းစားလေး ဖြစ်ပါတယ် 😏\n\n` +
+    `Private မှာတော့ အကုန် ဆွေးနွေးတိုင်ပင် ရင်ဖွင့်လို့ရပါတယ်…\n` +
     `Group မှာဆို Nora ကို reply ထောက်ပြီးပြော၊ ဒါမှမဟုတ် "${BOT_NAME}" လို့ခေါ်/mention လုပ်ပေးနော်။`;
 
-  await ctx.replyWithMarkdown(txt, mainMenu());
+  await ctx.reply(txt, mainMenu());
 });
 
 bot.command("help", async (ctx) => {
   await touchChat(ctx);
-  await ctx.replyWithMarkdown(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
+  await ctx.reply(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
 });
 
 bot.command("clear", async (ctx) => {
@@ -446,7 +464,7 @@ bot.command("clear", async (ctx) => {
   await ctx.reply("🧹 ဒီ chat အတွက် Nora memory ကို အကုန်ဖျက်လိုက်ပြီနော် 💙");
 });
 
-// /admin (owner)
+// /admin (owner only) — NO MARKDOWN
 bot.command("admin", async (ctx) => {
   await touchChat(ctx);
 
@@ -461,23 +479,25 @@ bot.command("admin", async (ctx) => {
   const uptime = formatUptime(Date.now() - STARTED_AT);
 
   const msg =
-    `👑 *${BOT_NAME} Admin Dashboard*\n\n` +
+    `👑 ${BOT_NAME} Admin Dashboard\n\n` +
     `Owner: ${LOVER_NAME} (ID: ${OWNER_ID})\n` +
     `AI_MODE: ${AI_MODE}\n` +
     `ARQ_API_URL: ${ARQ_API_URL}\n` +
     `Uptime: ${uptime}\n\n` +
-    `Chats: ${chatsTotal}\n- Private: ${privates}\n- Groups: ${groups}\n\n` +
+    `Chats: ${chatsTotal}\n` +
+    `- Private: ${privates}\n` +
+    `- Groups: ${groups}\n\n` +
     `Sessions (memory docs): ${sessions}\n\n` +
     `👇 အောက်က buttons နဲ့ စစ်လို့ရပါတယ်။`;
 
-  await ctx.replyWithMarkdown(msg, adminMenu());
+  await ctx.reply(msg, adminMenu());
 });
 
-// /broadcast (owner)
+// /broadcast (owner only) — NO MARKDOWN to avoid parse issues
 bot.command("broadcast", async (ctx) => {
   await touchChat(ctx);
 
-  if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
+  if (!isOwner(ctx)) {
     return ctx.reply(`ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`);
   }
 
@@ -488,7 +508,7 @@ bot.command("broadcast", async (ctx) => {
     return ctx.reply("Broadcast စာကို ဒီလိုသုံးပါနော်:\n\n/broadcast မင်္ဂလာပါ Nora fan တွေ 🌸");
   }
 
-  const message = `📢 *${BOT_NAME} Broadcast*\n\n${cleaned}`;
+  const message = `📢 ${BOT_NAME} Broadcast\n\n${cleaned}`;
 
   let sent = 0;
   let failed = 0;
@@ -497,10 +517,7 @@ bot.command("broadcast", async (ctx) => {
   while (await cursor.hasNext()) {
     const chat = await cursor.next();
     try {
-      await bot.telegram.sendMessage(chat._id, message, {
-        parse_mode: "Markdown",
-        disable_web_page_preview: true,
-      });
+      await bot.telegram.sendMessage(chat._id, message, { disable_web_page_preview: true });
       sent++;
     } catch (_) {
       failed++;
@@ -523,7 +540,7 @@ bot.action("MENU_MEMORY", async (ctx) => {
   const sessionId = getSessionId(ctx);
   const s = await loadSession(sessionId);
   const n = s.history?.length || 0;
-  await ctx.reply(`🧠 ဒီ chat memory items: ${n}\nမကြိုက်ရင် /clear နဲ့ ဖျက်လို့ရတယ် 😊`);
+  await ctx.reply(`🧠 ဒီ chat memory items: ${n}\nမကြိုက်ရင် ဖျက်လို့ရတယ် 😊`);
 });
 
 bot.action("MENU_CLEAR", async (ctx) => {
@@ -537,10 +554,11 @@ bot.action("MENU_CLEAR", async (ctx) => {
 bot.action("MENU_HELP", async (ctx) => {
   await ctx.answerCbQuery();
   await touchChat(ctx);
-  await ctx.replyWithMarkdown(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
+  await ctx.reply(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
 });
+
 // =====================
-// ADMIN BUTTON HANDLERS
+// ADMIN BUTTON HANDLERS (NO MARKDOWN)
 // =====================
 async function sendAdminHome(ctx) {
   const chatsTotal = await chatsCollection.countDocuments({});
@@ -550,46 +568,52 @@ async function sendAdminHome(ctx) {
   const uptime = formatUptime(Date.now() - STARTED_AT);
 
   const msg =
-    `👑 *${BOT_NAME} Admin Dashboard*\n\n` +
+    `👑 ${BOT_NAME} Admin Dashboard\n\n` +
     `Owner: ${LOVER_NAME} (ID: ${OWNER_ID})\n` +
     `AI_MODE: ${AI_MODE}\n` +
     `ARQ_API_URL: ${ARQ_API_URL}\n` +
     `Uptime: ${uptime}\n\n` +
-    `Chats: ${chatsTotal}\n- Private: ${privates}\n- Groups: ${groups}\n\n` +
+    `Chats: ${chatsTotal}\n` +
+    `- Private: ${privates}\n` +
+    `- Groups: ${groups}\n\n` +
     `Sessions (memory docs): ${sessions}\n\n` +
     `👇 အောက်က buttons နဲ့ စစ်လို့ရပါတယ်။`;
 
-  // edit if possible, fallback to reply
   try {
-    await ctx.editMessageText(msg, { parse_mode: "Markdown", ...adminMenu() });
+    await ctx.editMessageText(msg, adminMenu());
   } catch (_) {
-    await ctx.replyWithMarkdown(msg, adminMenu());
+    await ctx.reply(msg, adminMenu());
   }
 }
 
 async function sendList(ctx, isGroup, page = 0) {
   const limit = 20;
-  const skip = Math.max(0, page) * limit;
+  const safePage = Math.max(0, page);
+  const skip = safePage * limit;
 
   const q = { isGroup: !!isGroup };
   const total = await chatsCollection.countDocuments(q);
+
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const p = Math.min(safePage, pages - 1);
+
   const items = await chatsCollection
     .find(q)
     .sort({ lastSeen: -1 })
-    .skip(skip)
+    .skip(p * limit)
     .limit(limit)
     .toArray();
-
-  const pages = Math.max(1, Math.ceil(total / limit));
-  const p = Math.min(Math.max(0, page), pages - 1);
 
   const title = isGroup ? "👥 Group List" : "👤 Users List";
   const header = `${title}\nPage: ${p + 1}/${pages}\nTotal: ${total}\n`;
 
+  const hasPrev = p > 0;
+  const hasNext = (p + 1) * limit < total;
+  const kb = pagerButtons(isGroup ? "GROUPS" : "USERS", p, hasPrev, hasNext);
+
   if (!items.length) {
-    const kb = pagerButtons(isGroup ? "GROUPS" : "USERS", p, p > 0, skip + limit < total);
     try {
-      return await ctx.editMessageText(header + "\n(No data yet)", { ...kb });
+      return await ctx.editMessageText(header + "\n(No data yet)", kb);
     } catch (_) {
       return await ctx.reply(header + "\n(No data yet)", kb);
     }
@@ -603,10 +627,6 @@ async function sendList(ctx, isGroup, page = 0) {
   });
 
   const text = header + "\n" + lines.join("\n");
-
-  const hasPrev = p > 0;
-  const hasNext = (p + 1) * limit < total;
-  const kb = pagerButtons(isGroup ? "GROUPS" : "USERS", p, hasPrev, hasNext);
 
   try {
     await ctx.editMessageText(text, { disable_web_page_preview: true, ...kb });
@@ -638,19 +658,20 @@ bot.action("ADMIN_UPTIME", async (ctx) => {
   const started = new Date(STARTED_AT).toISOString();
 
   const text =
-    `⏱ *Uptime*\n\n` +
+    `⏱ Uptime\n\n` +
     `Uptime: ${uptime}\n` +
     `StartedAt (ISO): ${started}\n\n` +
-    `Render က service restart ဖြစ်ရင် uptime ပြန် reset ဖြစ်မယ်နော်။`;
+    `Service restart ဖြစ်ရင် uptime ပြန် reset ဖြစ်မယ်နော်။`;
 
+  const kb = Markup.inlineKeyboard([[Markup.button.callback("🏠 Admin", "ADMIN_HOME")]]);
   try {
-    await ctx.editMessageText(text, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🏠 Admin", "ADMIN_HOME")]]) });
+    await ctx.editMessageText(text, kb);
   } catch (_) {
-    await ctx.replyWithMarkdown(text, Markup.inlineKeyboard([[Markup.button.callback("🏠 Admin", "ADMIN_HOME")]]));
+    await ctx.reply(text, kb);
   }
 });
 
-// Pagination handlers: ADMIN_USERS:page, ADMIN_GROUPS:page
+// Pagination handlers
 bot.action(/^ADMIN_USERS:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   if (!isOwner(ctx)) return;
@@ -703,7 +724,7 @@ bot.on(["text", "caption"], async (ctx) => {
   try {
     const reply = await generateReply(ctx, text);
 
-    // save memory (optional but useful for /memory count + /clear)
+    // save memory
     history.push({ role: "user", content: text, at: new Date() });
     history.push({ role: "assistant", content: reply, at: new Date() });
     session.history = history.slice(-MAX_HISTORY);
@@ -714,7 +735,7 @@ bot.on(["text", "caption"], async (ctx) => {
     console.error("Handler error:", e?.message || e);
     await sendLongMessage(
       ctx,
-      `အင်း… ${getDisplayName(ctx)} လေး 🥲\nNora ဘက်က error ဖြစ်သွားတယ်။ ခဏနောက်တစ်ခါထပ်ပို့ပေးပါနော် 💜`,
+      `အင်း… ${getDisplayName(ctx)} လေး 🥲\nNora ဘက်က error ဖြစ်သွားတယ်။ နောက်တစ်ခါထပ်ပို့ပေးပါနော် 💜`,
       replyExtra
     );
   }
@@ -741,9 +762,9 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`;
     });
 
     // Telegram webhook route — JSON only here
-    app.post(SECRET_PATH, express.json(), bot.webhookCallback(SECRET_PATH));
+    app.post(SECRET_PATH, express.json({ limit: "2mb" }), bot.webhookCallback(SECRET_PATH));
 
-    const PORT = process.env.PORT || 10000;
+    const PORT = parseInt(process.env.PORT || "10000", 10);
     app.listen(PORT, async () => {
       console.log(`HTTP server listening on port ${PORT} ✅`);
 
