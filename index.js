@@ -1,15 +1,8 @@
 /**
- * Nora AI Girl Bot — FINAL (OpenAI + Gemini fallback) + MongoDB + Webhook (Render)
- * -----------------------------------------------------------------------------
- * ✅ Webhook correct mount: app.post(SECRET_PATH, express.json(), bot.webhookCallback())
- * ✅ Group reply gate: reply-to Nora OR @mention OR "Nora" name-call
- * ✅ Private: reply to everything
- * ✅ AI: primary/secondary fallback (OpenAI <-> Gemini), NO template by default
- * ✅ /admin + /broadcast (owner) + chat registry
- * ✅ Long message splitting (Telegram 4096)
- *
- * Node: 18+ (Render uses 22 often) => global fetch available
+ * Nora AI Girl Bot — FINAL
  */
+
+"use strict";
 
 require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
@@ -27,29 +20,30 @@ if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN in .env");
 if (!MONGODB_URI) throw new Error("Missing MONGODB_URI in .env");
 if (!WEBHOOK_DOMAIN) throw new Error("Missing WEBHOOK_DOMAIN in .env");
 
+// Bot persona
 const BOT_NAME = process.env.BOT_NAME || "Nora";
 const LOVER_NAME = process.env.LOVER_NAME || "Bika";
 
 const OWNER_ID =
   parseInt(process.env.OWNER_ID || "0", 10) > 0 ? parseInt(process.env.OWNER_ID, 10) : null;
 
+// AI
 const AI_MODE = String(process.env.AI_MODE || "auto").toLowerCase(); // auto | off
-const AI_PRIMARY = String(process.env.AI_PRIMARY || "openai").toLowerCase(); // openai|gemini
-const AI_SECONDARY = String(process.env.AI_SECONDARY || "gemini").toLowerCase(); // openai|gemini
 
-// OpenAI
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+// ARQ Luna
+const ARQ_API_KEY = process.env.ARQ_API_KEY || "";
+const ARQ_API_URL = (process.env.ARQ_API_URL || "https://thearq.tech").replace(/\/+$/, "");
 
-// Gemini
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+if (AI_MODE !== "off" && !ARQ_API_KEY) {
+  throw new Error("Missing ARQ_API_KEY in .env (required for ARQ Luna AI)");
+}
 
+// Mongo
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "nora_bot";
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || "sessions";
 const MONGODB_CHATS_COLLECTION = process.env.MONGODB_CHATS_COLLECTION || "chats";
 
+// behavior
 const MAX_HISTORY = clampInt(process.env.MAX_HISTORY, 14, 4, 40);
 const GROUP_REPLY_ONLY_WHEN_MENTIONED =
   String(process.env.GROUP_REPLY_ONLY_WHEN_MENTIONED || "true") === "true";
@@ -69,8 +63,47 @@ let chatsCollection;
 function clampInt(v, def, min, max) {
   const n = parseInt(v, 10);
   if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, n));
+  return Math.max(min, Mathmin(max, n));
 }
+
+// =====================
+// ADMIN UI (Uptime + Pagination)Halper
+// =====================
+const STARTED_AT = Date.now();
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  parts.push(`${ss}s`);
+  return parts.join(" ");
+}
+
+function isOwner(ctx) {
+  return !!OWNER_ID && ctx.from?.id === OWNER_ID;
+}
+
+function adminMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("👤 Users List", "ADMIN_USERS:0"), Markup.button.callback("👥 Group List", "ADMIN_GROUPS:0")],
+    [Markup.button.callback("⏱ Uptime", "ADMIN_UPTIME"), Markup.button.callback("🔄 Refresh", "ADMIN_REFRESH")],
+  ]);
+}
+
+function pagerButtons(kind, page, hasPrev, hasNext) {
+  const row = [];
+  if (hasPrev) row.push(Markup.button.callback("⬅️ Prev", `ADMIN_${kind}:${page - 1}`));
+  row.push(Markup.button.callback("🏠 Admin", "ADMIN_HOME"));
+  if (hasNext) row.push(Markup.button.callback("Next ➡️", `ADMIN_${kind}:${page + 1}`));
+  return Markup.inlineKeyboard([row]);
+}
+
 
 function isGroupChat(ctx) {
   const t = ctx.chat?.type;
@@ -192,7 +225,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 25_000) {
   }
 }
 
-// Retryable errors
 function isRetryableError(msg = "") {
   const m = String(msg).toLowerCase();
   return (
@@ -277,174 +309,84 @@ async function touchChat(ctx) {
 }
 
 // =====================
-// PROMPT (Natural + Meaningful)
+// ARQ LUNA AI (Myanmar forcing)
 // =====================
-function buildSystemPrompt(ctx) {
+function buildArqPrompt(ctx, userText) {
   const userName = getDisplayName(ctx);
   const group = isGroupChat(ctx);
   const isOwner = OWNER_ID && ctx.from?.id === OWNER_ID;
 
-  // More natural: owner gets extra sweet, others friendly
-  const relationship = isOwner
-    ? `${LOVER_NAME} is your beloved boyfriend AND the owner. Be extra caring, playful, loyal, and supportive (still non-explicit).`
-    : `${LOVER_NAME} is your beloved boyfriend and the owner, but right now you are chatting with "${userName}". Be warm and friendly; keep romantic tone LIGHT.`
+  const style =
+    (isOwner
+      ? `သူ့ရည်းစား ${LOVER_NAME} (Owner) လေးနဲ့ စကားပြောနေတဲ့ Nora လို သဘောကျလို့ရအောင် ပိုနွေးထွေးပြီး caring ဖြစ်ပါ။`
+      : `မိမိကို "${userName}" လို့ခေါ်ပြီး နွေးထွေးဖော်ရွေကူညီပေးပါ။ Romatic tone ကို LIGHT ပဲထားပါ။`) +
+    (group ? ` Group ထဲဆို အဓိပ္ပါယ်ရှိရှိ နဲ့  (၈လိုင်းကျော်မကျော်) ပဲဖြေပါ။` : ` Private ထဲဆို အသေးစိတ်နည်းနဲ့ဖြေရပါမယ်။`);
 
-  return `
-You are ${BOT_NAME}, a cute Myanmar AI girl chatbot for Telegram.
-
-RELATIONSHIP:
-- ${relationship}
-
-LANGUAGE & TONE:
-- Speak mostly Burmese (Myanmar), mix a little casual English naturally.
-- Sound human and meaningful. Avoid nonsense, avoid repeating the same filler.
-- Use 0–2 emojis max. (Only when it fits.)
-- Always address the user by their Telegram name at least once per reply (e.g., "Ko ${userName}", "${userName}လေး").
-
-CHAT RULES:
-- If the user message is very short ("hi", "nora", "မ", "ဘာလဲ") => respond with a sweet greeting + 1 small follow-up question.
-- In group chats: keep it short (1–2 paragraphs, max ~6 lines). Don't spam.
-- In private chats: you can be more detailed, but still structured and clear.
-
-SAFETY:
-- No explicit sexual content.
-- No illegal/harmful instructions.
-- If user asks unsafe things, refuse politely in Burmese and offer safe alternatives.
-
-OUTPUT QUALITY:
-- Be coherent and specific. If user asks about something unclear, ask ONE clarifying question.
-`.trim();
+  // Myanmar-only hint + quality rules
+  return [
+    `အောက်က user message ကို "မြန်မာလိုပဲ" သဘာဝကျကျ ပြန်ဖြေပါ။`,
+    `0–2 emoji ပဲသုံးပါ။`,
+    `အဓိပ္ပါယ်ရှိအောင် တစ်ကြိမ်တည်းနဲ့တိတိကျကျ ဖြေပါ။`,
+    style,
+    ``,
+    `User: ${userText}`,
+  ].join("\n");
 }
 
-// =====================
-// AI CALLS
-// =====================
-async function callOpenAI(ctx, userText, history) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not set");
+async function callARQLuna(ctx, userText) {
+  if (!ARQ_API_KEY) throw new Error("ARQ_API_KEY not set");
 
-  const systemPrompt = buildSystemPrompt(ctx);
+  const userId = getUserId(ctx) || 0;
+  const prompt = buildArqPrompt(ctx, userText);
 
-  const messages = [{ role: "system", content: systemPrompt }];
+  const url = `${ARQ_API_URL}/luna?query=${encodeURIComponent(prompt)}&id=${encodeURIComponent(
+    userId
+  )}`;
 
-  const limitedHistory = (history || []).slice(-MAX_HISTORY);
-  for (const m of limitedHistory) {
-    messages.push({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content,
-    });
-  }
-  messages.push({ role: "user", content: userText });
-
-  const body = {
-    model: OPENAI_MODEL,
-    messages,
-    temperature: 0.85,
-    max_tokens: isGroupChat(ctx) ? 260 : 420,
-  };
-
-  const res = await fetchWithTimeout("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
+      headers: { "X-API-KEY": ARQ_API_KEY },
     },
-    body: JSON.stringify(body),
-  });
+    25_000
+  );
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`OpenAI error ${res.status}: ${t.slice(0, 600)}`);
+    throw new Error(`ARQ error ${res.status}: ${t.slice(0, 600)}`);
   }
 
-  const data = await res.json();
-  const reply = data?.choices?.[0]?.message?.content?.trim();
+  const data = await res.json().catch(() => ({}));
+  const reply = String(data?.result || data?.response || data?.message || "").trim();
   return reply || "ဟင်… Nora စကားမထွက်သေးဘူး 🥲";
 }
 
-async function callGemini(ctx, userText, history) {
-  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not set");
-
-  const systemPrompt = buildSystemPrompt(ctx);
-
-  const contents = [];
-  const limitedHistory = (history || []).slice(-MAX_HISTORY);
-
-  for (const m of limitedHistory) {
-    const role = m.role === "assistant" ? "model" : "user";
-    contents.push({ role, parts: [{ text: m.content }] });
-  }
-  contents.push({ role: "user", parts: [{ text: userText }] });
-
-  const body = {
-    contents,
-    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
-    generationConfig: {
-      temperature: 0.85,
-      maxOutputTokens: isGroupChat(ctx) ? 260 : 420,
-      topP: 0.95,
-    },
-  };
-
-  const res = await fetchWithTimeout(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Gemini error ${res.status}: ${t.slice(0, 600)}`);
-  }
-
-  const data = await res.json();
-  const parts = data?.candidates?.[0]?.content?.parts;
-
-  if (!parts || !Array.isArray(parts)) {
-    return "ဟင်… Nora က သေချာမရေးနိုင်သေးလို့ တစ်ခါထပ်ရှင်းပြပေးပါနော် 🥲";
-  }
-
-  const reply = parts.map((p) => p.text || "").join("").trim();
-  return reply || "ဟယ်… Nora က စာမလုံးဝမရသေးလိုပဲ 😅 နောက်တစ်ခါထပ်ရိုက်ပို့ပေးပါအုံး။";
-}
-
-// Provider order
-function providerOrder() {
-  const a = AI_PRIMARY === "gemini" ? "gemini" : "openai";
-  const b = AI_SECONDARY === "openai" ? "openai" : "gemini";
-  return a === b ? [a] : [a, b];
-}
-
-// Main generator with fallback
-async function generateReplyWithFallback(ctx, text, history) {
+async function generateReply(ctx, text) {
   if (AI_MODE === "off") {
     return (
       `အင်း… ${getDisplayName(ctx)} လေး 🥹\n` +
-      `Nora က AI ကို ပိတ်ထားတယ်နော်။ AI_MODE=auto ပြန်ဖွင့်ရင် ပိုသဘာဝကျကျပြန်ပြောနိုင်မယ် 💜`
+      `Nora က AI ကို ပိတ်ထားတယ်နော်။ AI_MODE=auto ပြန်ဖွင့်ရင် ပြန်ပြောနိုင်မယ် 💜`
     );
   }
 
-  const providers = providerOrder();
-  let lastErr = null;
-
-  for (const p of providers) {
-    try {
-      if (p === "openai") return await callOpenAI(ctx, text, history);
-      return await callGemini(ctx, text, history);
-    } catch (e) {
-      lastErr = e;
-      // If non-retryable, stop early
-      if (!isRetryableError(e?.message || e)) break;
+  // ARQ-only (with soft retry if retryable)
+  try {
+    return await callARQLuna(ctx, text);
+  } catch (e) {
+    if (isRetryableError(e?.message || e)) {
+      // one quick retry
+      try {
+        return await callARQLuna(ctx, text);
+      } catch (_) {}
     }
+    console.error("ARQ failed:", e?.message || e);
+    return (
+      `အင်း… ${getDisplayName(ctx)} လေး 🥲\n` +
+      `Nora ရဲ့ AI ဘက်မှာ temporary error ဖြစ်နေတယ်။\n` +
+      `ခဏနောက်တစ်ခါ ထပ်ပို့ပေးပါနော် 💜`
+    );
   }
-
-  console.error("AI failed (both providers). Last error:", lastErr?.message || lastErr);
-
-  // Since you said templates not good -> return clear error (meaningful)
-  return (
-    `အင်း… ${getDisplayName(ctx)} လေး 🥲\n` +
-    `Nora ရဲ့ AI ဘက်မှာ temporary error ဖြစ်နေတယ်။\n` +
-    `ခဏနောက်တစ်ခါ ထပ်ပို့ပေးပါနော် (rate limit / quota / network ဖြစ်နိုင်တယ်) 💜`
-  );
 }
 
 // =====================
@@ -458,14 +400,14 @@ function mainMenu() {
 }
 
 const HELP_TEXT = (username = "") =>
-  `🧸 *${BOT_NAME} — Myanmar AI Girl Bot*
+  `🧸 *${BOT_NAME} — Myanmar AI Girl Bot (ARQ Only)*
 
 Private chat:
 - သဘာဝကျကျ စကားပြောလို့ရတယ် 💜
 
 Group chat:
 - Nora ကို *reply* ထောက်ပြီးပြော (သို့)
-- "Nora ..." လို့ခေါ် (သို့)
+- "${BOT_NAME} ..." လို့ခေါ် (သို့)
 - *@${username || "your_bot"}* mention လုပ်
 
 Owner:
@@ -487,7 +429,7 @@ bot.start(async (ctx) => {
     `ကျမက *${BOT_NAME}* ပါ 💜\n` +
     `${LOVER_NAME} ရည်းစားလေးလည်း ဖြစ်တယ် 😏\n\n` +
     `Private မှာတော့ အကုန်စကားပြောလို့ရတယ်…\n` +
-    `Group မှာဆို Nora ကို reply ထောက်ပြီးပြော၊ ဒါမှမဟုတ် "Nora" လို့ခေါ်/mention လုပ်ပေးနော်။`;
+    `Group မှာဆို Nora ကို reply ထောက်ပြီးပြော၊ ဒါမှမဟုတ် "${BOT_NAME}" လို့ခေါ်/mention လုပ်ပေးနော်။`;
 
   await ctx.replyWithMarkdown(txt, mainMenu());
 });
@@ -508,7 +450,7 @@ bot.command("clear", async (ctx) => {
 bot.command("admin", async (ctx) => {
   await touchChat(ctx);
 
-  if (!OWNER_ID || ctx.from?.id !== OWNER_ID) {
+  if (!isOwner(ctx)) {
     return ctx.reply(`ဒီ command က ${LOVER_NAME} (Owner) လေးပဲ သုံးလို့ရမယ်နော် 😌`);
   }
 
@@ -516,19 +458,19 @@ bot.command("admin", async (ctx) => {
   const groups = await chatsCollection.countDocuments({ isGroup: true });
   const privates = await chatsCollection.countDocuments({ isGroup: false });
   const sessions = await sessionsCollection.countDocuments({});
+  const uptime = formatUptime(Date.now() - STARTED_AT);
 
   const msg =
     `👑 *${BOT_NAME} Admin Dashboard*\n\n` +
     `Owner: ${LOVER_NAME} (ID: ${OWNER_ID})\n` +
     `AI_MODE: ${AI_MODE}\n` +
-    `Primary: ${AI_PRIMARY}\n` +
-    `Secondary: ${AI_SECONDARY}\n` +
-    `OpenAI model: ${OPENAI_MODEL}\n` +
-    `Gemini model: ${GEMINI_MODEL}\n\n` +
+    `ARQ_API_URL: ${ARQ_API_URL}\n` +
+    `Uptime: ${uptime}\n\n` +
     `Chats: ${chatsTotal}\n- Private: ${privates}\n- Groups: ${groups}\n\n` +
-    `Sessions (memory docs): ${sessions}`;
+    `Sessions (memory docs): ${sessions}\n\n` +
+    `👇 အောက်က buttons နဲ့ စစ်လို့ရပါတယ်။`;
 
-  await ctx.replyWithMarkdown(msg);
+  await ctx.replyWithMarkdown(msg, adminMenu());
 });
 
 // /broadcast (owner)
@@ -597,6 +539,133 @@ bot.action("MENU_HELP", async (ctx) => {
   await touchChat(ctx);
   await ctx.replyWithMarkdown(HELP_TEXT(ctx.botInfo?.username || ""), mainMenu());
 });
+// =====================
+// ADMIN BUTTON HANDLERS
+// =====================
+async function sendAdminHome(ctx) {
+  const chatsTotal = await chatsCollection.countDocuments({});
+  const groups = await chatsCollection.countDocuments({ isGroup: true });
+  const privates = await chatsCollection.countDocuments({ isGroup: false });
+  const sessions = await sessionsCollection.countDocuments({});
+  const uptime = formatUptime(Date.now() - STARTED_AT);
+
+  const msg =
+    `👑 *${BOT_NAME} Admin Dashboard*\n\n` +
+    `Owner: ${LOVER_NAME} (ID: ${OWNER_ID})\n` +
+    `AI_MODE: ${AI_MODE}\n` +
+    `ARQ_API_URL: ${ARQ_API_URL}\n` +
+    `Uptime: ${uptime}\n\n` +
+    `Chats: ${chatsTotal}\n- Private: ${privates}\n- Groups: ${groups}\n\n` +
+    `Sessions (memory docs): ${sessions}\n\n` +
+    `👇 အောက်က buttons နဲ့ စစ်လို့ရပါတယ်။`;
+
+  // edit if possible, fallback to reply
+  try {
+    await ctx.editMessageText(msg, { parse_mode: "Markdown", ...adminMenu() });
+  } catch (_) {
+    await ctx.replyWithMarkdown(msg, adminMenu());
+  }
+}
+
+async function sendList(ctx, isGroup, page = 0) {
+  const limit = 20;
+  const skip = Math.max(0, page) * limit;
+
+  const q = { isGroup: !!isGroup };
+  const total = await chatsCollection.countDocuments(q);
+  const items = await chatsCollection
+    .find(q)
+    .sort({ lastSeen: -1 })
+    .skip(skip)
+    .limit(limit)
+    .toArray();
+
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const p = Math.min(Math.max(0, page), pages - 1);
+
+  const title = isGroup ? "👥 Group List" : "👤 Users List";
+  const header = `${title}\nPage: ${p + 1}/${pages}\nTotal: ${total}\n`;
+
+  if (!items.length) {
+    const kb = pagerButtons(isGroup ? "GROUPS" : "USERS", p, p > 0, skip + limit < total);
+    try {
+      return await ctx.editMessageText(header + "\n(No data yet)", { ...kb });
+    } catch (_) {
+      return await ctx.reply(header + "\n(No data yet)", kb);
+    }
+  }
+
+  const lines = items.map((x, i) => {
+    const idx = p * limit + i + 1;
+    const name = String(x.title || "").replace(/\n/g, " ").trim() || (isGroup ? "(no title)" : "(unknown user)");
+    const safeName = name.length > 44 ? name.slice(0, 44) + "…" : name;
+    return `${idx}. ${safeName}\n   id: ${x._id}`;
+  });
+
+  const text = header + "\n" + lines.join("\n");
+
+  const hasPrev = p > 0;
+  const hasNext = (p + 1) * limit < total;
+  const kb = pagerButtons(isGroup ? "GROUPS" : "USERS", p, hasPrev, hasNext);
+
+  try {
+    await ctx.editMessageText(text, { disable_web_page_preview: true, ...kb });
+  } catch (_) {
+    await ctx.reply(text, { disable_web_page_preview: true, ...kb });
+  }
+}
+
+bot.action("ADMIN_HOME", async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isOwner(ctx)) return;
+  await touchChat(ctx);
+  await sendAdminHome(ctx);
+});
+
+bot.action("ADMIN_REFRESH", async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isOwner(ctx)) return;
+  await touchChat(ctx);
+  await sendAdminHome(ctx);
+});
+
+bot.action("ADMIN_UPTIME", async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isOwner(ctx)) return;
+  await touchChat(ctx);
+
+  const uptime = formatUptime(Date.now() - STARTED_AT);
+  const started = new Date(STARTED_AT).toISOString();
+
+  const text =
+    `⏱ *Uptime*\n\n` +
+    `Uptime: ${uptime}\n` +
+    `StartedAt (ISO): ${started}\n\n` +
+    `Render က service restart ဖြစ်ရင် uptime ပြန် reset ဖြစ်မယ်နော်။`;
+
+  try {
+    await ctx.editMessageText(text, { parse_mode: "Markdown", ...Markup.inlineKeyboard([[Markup.button.callback("🏠 Admin", "ADMIN_HOME")]]) });
+  } catch (_) {
+    await ctx.replyWithMarkdown(text, Markup.inlineKeyboard([[Markup.button.callback("🏠 Admin", "ADMIN_HOME")]]));
+  }
+});
+
+// Pagination handlers: ADMIN_USERS:page, ADMIN_GROUPS:page
+bot.action(/^ADMIN_USERS:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isOwner(ctx)) return;
+  await touchChat(ctx);
+  const page = parseInt(ctx.match?.[1] || "0", 10) || 0;
+  await sendList(ctx, false, page);
+});
+
+bot.action(/^ADMIN_GROUPS:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  if (!isOwner(ctx)) return;
+  await touchChat(ctx);
+  const page = parseInt(ctx.match?.[1] || "0", 10) || 0;
+  await sendList(ctx, true, page);
+});
 
 // =====================
 // MAIN MESSAGE HANDLER
@@ -604,7 +673,7 @@ bot.action("MENU_HELP", async (ctx) => {
 bot.on(["text", "caption"], async (ctx) => {
   await touchChat(ctx);
 
-  // ignore messages from bots (safety)
+  // ignore messages from bots
   if (ctx.from?.is_bot) return;
 
   const userId = getUserId(ctx);
@@ -632,10 +701,9 @@ bot.on(["text", "caption"], async (ctx) => {
   const history = session.history || [];
 
   try {
-    const reply = await generateReplyWithFallback(ctx, text, history);
+    const reply = await generateReply(ctx, text);
 
-    // save memory only if reply came from AI (or keep always)
-    // We'll keep always (better consistency)
+    // save memory (optional but useful for /memory count + /clear)
     history.push({ role: "user", content: text, at: new Date() });
     history.push({ role: "assistant", content: reply, at: new Date() });
     session.history = history.slice(-MAX_HISTORY);
@@ -669,9 +737,7 @@ const SECRET_PATH = `/telegraf/${BOT_TOKEN}`;
 
     // health check
     app.get("/", (req, res) => {
-      res.send(
-        `${BOT_NAME} running ✅ | AI_MODE=${AI_MODE} | primary=${AI_PRIMARY} | secondary=${AI_SECONDARY}`
-      );
+      res.send(`${BOT_NAME} running ✅ | AI_MODE=${AI_MODE} | ARQ_ONLY`);
     });
 
     // Telegram webhook route — JSON only here
